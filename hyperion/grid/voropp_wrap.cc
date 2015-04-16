@@ -9,6 +9,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "voro++/voro++.hh"
@@ -111,14 +112,55 @@ static inline void add_walls(container &con,const char *wall_str,const double *w
     }
 }
 
+struct work_t
+{
+    work_t(int min, int max):min_idx(min),max_idx(max) {}
+    work_t(work_t &&w):min_idx(w.min_idx),max_idx(w.max_idx) {}
+    friend std::ostream &operator<<(std::ostream &os, const work_t &w)
+    {
+        os << '(' << w.min_idx << ',' << w.max_idx << ')';
+        return os;
+    }
+    const int           min_idx;
+    const int           max_idx;
+};
+
 // Main wrapper called from cpython.
 const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes, double **bb_min, double **bb_max, double **vertices,
-                                 int *max_nv, double xmin, double xmax, double ymin, double ymax, double zmin, double zmax, double const *points,
+                                 int *max_nv, double xmin, double xmax, double ymin, double ymax, double zmin, double zmax, double const *points_,
                                  int nsites, int with_vertices, const char *wall_str, const double *wall_args_arr, int n_wall_args, int verbose)
 {
     // We need to wrap everything in a try/catch block as exceptions cannot leak out to C.
     try {
+    
+    std::vector<std::array<double,3>> tmp_copy;
+    for (int i = 0; i < nsites; ++i) {
+        tmp_copy.push_back({points_[i*3],points_[i*3+1],points_[i*3+2]});
+    }
+    std::random_device rd;
+    std::mt19937 rng(rd());
+    std::shuffle(tmp_copy.begin(),tmp_copy.end(),rng);
+    std::vector<double> v_points;
+    for (int i = 0; i < nsites; ++i) {
+        v_points.push_back(tmp_copy[i][0]);
+        v_points.push_back(tmp_copy[i][1]);
+        v_points.push_back(tmp_copy[i][2]);
+    }
+    double *points = &v_points[0];
 
+
+    int nthreads = std::thread::hardware_concurrency();
+    if (nthreads == 0) {
+        std::cout << "WARNING: could not determine the number of threads to use, falling back to 1.\n";
+        nthreads = 1;
+    }
+    int work_per_thread = nsites / nthreads;
+    std::vector<work_t> work_v;
+    for (int i = 0; i < nthreads; ++i) {
+        work_t tmp(i*work_per_thread,(i == nthreads - 1) ? nsites : (i + 1)*work_per_thread);
+        work_v.push_back(std::move(tmp));
+    }
+    
     // Total number of blocks we want.
     const double nblocks = nsites / particle_block;
 
@@ -141,6 +183,7 @@ const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes
         std::cout << "Initialising with the following block grid: " << nx << ',' << ny << ',' << nz << '\n';
         std::cout << std::boolalpha;
         std::cout << "Vertices: " << bool(with_vertices) << '\n';
+        std::cout << "Number of threads: " << nthreads << '\n';
     }
 
     // Prepare the output quantities.
@@ -151,68 +194,100 @@ const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes
     if (with_vertices) {
         vertices_list.resize(nsites);
     }
+
     // Volumes.
     ptr_raii<double> vols(static_cast<double *>(std::malloc(sizeof(double) * nsites)));
     // Bounding boxes.
     ptr_raii<double> bb_m(static_cast<double *>(std::malloc(sizeof(double) * nsites * 3)));
     ptr_raii<double> bb_M(static_cast<double *>(std::malloc(sizeof(double) * nsites * 3)));
-    
-    // Initialise the voro++ container.
-    container con(xmin,xmax,ymin,ymax,zmin,zmax,nx,ny,nz,
-                  false,false,false,8);
-    for(int i = 0; i < nsites; ++i) {
-            con.put(i,points[i*3],points[i*3 + 1],points[i*3 + 2]);
-    }
 
-    // Handle the walls.
-    add_walls(con,wall_str,wall_args_arr,n_wall_args,verbose);
+    auto thread_function = [
+            xmin,xmax,ymin,ymax,zmin,zmax,nx,ny,nz,nsites,points,&work_v,
+            wall_str,wall_args_arr,n_wall_args,verbose,with_vertices,&vertices_list,&n_list,
+            &vols,&bb_m,&bb_M
+        ](int thread_idx) -> void
+    {
+        // This object will record the indices/positions in the voro container
+        // of the particles whose cells will be computed by this thread.
+        particle_order po;
+        const auto min_idx = work_v[thread_idx].min_idx, max_idx = work_v[thread_idx].max_idx;
+        // Initialise the voro++ container.
+        container con(xmin,xmax,ymin,ymax,zmin,zmax,nx,ny,nz,
+                    false,false,false,8);
+        for(int i = 0; i < nsites; ++i) {
+                if (i >= min_idx && i < max_idx) {
+                    // If the particle is one of those whose cell is to be computed
+                    // by this thread, then add the particle to the container *and*
+                    // store it in the particle_order.
+                    con.put(po,i,points[i*3],points[i*3 + 1],points[i*3 + 2]);
+                } else {
+                    // Otherwise, just add the particle to the container.
+                    con.put(i,points[i*3],points[i*3 + 1],points[i*3 + 2]);
+                }
+        }
 
-    // Initialise the looping variables and the temporary cell object used for computation.
-    voronoicell_neighbor c;
-    c_loop_all vl(con);
-    int idx;
-    double tmp_min[3],tmp_max[3];
-    std::vector<double> tmp_v;
-    // Site position and radius (r is unused).
-    double x,y,z,r;
+        // Handle the walls.
+        add_walls(con,wall_str,wall_args_arr,n_wall_args,verbose);
 
-    // Loop over all particles and compute the desired quantities.
-    if(vl.start()) {
-        do {
-            // Get the id and position of the site being considered.
-            vl.pos(idx,x,y,z,r);
-            std::vector<double> *tmp_vertices = with_vertices ? &(vertices_list[idx]) : &tmp_v; 
-            // Compute the voronoi cell.
-            con.compute_cell(c,vl);
-            // Compute the neighbours.
-            c.neighbors(n_list[idx]);
-            // Volume.
-            vols.get()[idx] = c.volume();
-            // Compute bounding box. Start by asking for the vertices.
-            c.vertices(x,y,z,*tmp_vertices);
-            // Init min/max bb.
-            std::copy(tmp_vertices->begin(),tmp_vertices->begin() + 3,tmp_min);
-            std::copy(tmp_vertices->begin(),tmp_vertices->begin() + 3,tmp_max);
-            for (unsigned long i = 1u; i < tmp_vertices->size() / 3u; ++i) {
-                for (unsigned j = 0; j < 3; ++j) {
-                    if ((*tmp_vertices)[i * 3 + j] < tmp_min[j]) {
-                        tmp_min[j] = (*tmp_vertices)[i * 3 + j];
-                    }
-                    if ((*tmp_vertices)[i * 3 + j] > tmp_max[j]) {
-                        tmp_max[j] = (*tmp_vertices)[i * 3 + j];
+        // Initialise the looping variables and the temporary cell object used for computation.
+        voronoicell_neighbor c;
+        c_loop_order vl(con,po);
+        int idx;
+        double tmp_min[3],tmp_max[3];
+        std::vector<double> tmp_v;
+        // Site position and radius (r is unused).
+        double x,y,z,r;
+
+        // Loop over all particles and compute the desired quantities.
+        if(vl.start()) {
+            do {
+                // Get the id and position of the site being considered.
+                vl.pos(idx,x,y,z,r);
+if (idx < min_idx || idx >= max_idx) {
+    std::cout << "noooooooooooooooo\n";
+}
+                std::vector<double> *tmp_vertices = with_vertices ? &(vertices_list[idx]) : &tmp_v; 
+                // Compute the voronoi cell.
+                con.compute_cell(c,vl);
+                // Compute the neighbours.
+                c.neighbors(n_list[idx]);
+                // Volume.
+                vols.get()[idx] = c.volume();
+                // Compute bounding box. Start by asking for the vertices.
+                c.vertices(x,y,z,*tmp_vertices);
+                // Init min/max bb.
+                std::copy(tmp_vertices->begin(),tmp_vertices->begin() + 3,tmp_min);
+                std::copy(tmp_vertices->begin(),tmp_vertices->begin() + 3,tmp_max);
+                for (unsigned long i = 1u; i < tmp_vertices->size() / 3u; ++i) {
+                    for (unsigned j = 0; j < 3; ++j) {
+                        if ((*tmp_vertices)[i * 3 + j] < tmp_min[j]) {
+                            tmp_min[j] = (*tmp_vertices)[i * 3 + j];
+                        }
+                        if ((*tmp_vertices)[i * 3 + j] > tmp_max[j]) {
+                            tmp_max[j] = (*tmp_vertices)[i * 3 + j];
+                        }
                     }
                 }
-            }
-            // Copy the bounding box into the output array.
-            std::copy(tmp_min,tmp_min + 3,bb_m.get() + idx * 3);
-            std::copy(tmp_max,tmp_max + 3,bb_M.get() + idx * 3);
-        } while(vl.inc());   
+                // Copy the bounding box into the output array.
+                std::copy(tmp_min,tmp_min + 3,bb_m.get() + idx * 3);
+                std::copy(tmp_max,tmp_max + 3,bb_M.get() + idx * 3);
+            } while(vl.inc());   
+        }
+    };
+
+    std::vector<std::unique_ptr<std::thread>> threads;
+    for (int i = 0; i < nthreads; ++i) {
+        threads.emplace_back(new std::thread(thread_function,i));
+    }
+
+    for (auto &t: threads) {
+        t->join();
     }
 
     // The voro++ doc say that in case of numerical errors the neighbours list might not be symmetric,
     // that is, if 'a' is a neighbour of 'b' then 'b' might not be a neighbour of 'a'. We check and fix this
     // in the loop below.
-    for (idx = 0; idx < nsites; ++idx) {
+    for (int idx = 0; idx < nsites; ++idx) {
         for (unsigned j = 0u; j < n_list[idx].size(); ++j) {
             // Check only non-wall neighbours.
             if (n_list[idx][j] >= 0 && std::find(n_list[n_list[idx][j]].begin(),n_list[n_list[idx][j]].end(),idx) == n_list[n_list[idx][j]].end()) {
@@ -228,7 +303,7 @@ const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes
     // Allocate space for flat array of neighbours.
     ptr_raii<int> neighs(static_cast<int *>(std::malloc(sizeof(int) * nsites * (*max_nn))));
     // Fill it in.
-    for (idx = 0; idx < nsites; ++idx) {
+    for (int idx = 0; idx < nsites; ++idx) {
         int *ptr = neighs.get() + (*max_nn) * idx;
         std::copy(n_list[idx].begin(),n_list[idx].end(),ptr);
         // Fill empty elements with -10.
@@ -243,7 +318,7 @@ const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes
         // Allocate space for flat array of vertices.
         ptr_raii<double> verts(static_cast<double *>(std::malloc(sizeof(double) * nsites * (*max_nv))));
         // Fill it in.
-        for (idx = 0; idx < nsites; ++idx) {
+        for (int idx = 0; idx < nsites; ++idx) {
             double *ptr = verts.get() + (*max_nv) * idx;
             std::copy(vertices_list[idx].begin(),vertices_list[idx].end(),ptr);
             // Fill empty elements with nan.

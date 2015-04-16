@@ -95,7 +95,19 @@ class voronoi_grid(object):
         self._with_vertices = with_vertices
 
         logger.info("Computing the tessellation via voro++")
+
+        ## Shuffle the input points, recording their order before the shuffle.
+        #s_index_array = np.arange(sites.shape[0])
+        ## Make it deterministic.
+        #np.random.seed(0)
+        #np.random.shuffle(s_index_array)
+        #s_sites = sites[s_index_array]
+        #print(type(s_sites))
+
+        import time
+        time_start = time.time()
         tup = _voropp_wrapper(sites, domain, with_vertices, wall, wall_args, 1 if verbose else 0)
+        print(time.time() - time_start)
         if with_vertices:
             t = Table([sites, tup[0], tup[1], tup[2], tup[3], tup[4]],
                       names=('coordinates', 'neighbours', 'volume', 'bb_min', 'bb_max', 'vertices'))
