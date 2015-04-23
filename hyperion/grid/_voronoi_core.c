@@ -5,7 +5,7 @@
 #include <numpy/npy_math.h>
 
 // Declaration of the voro++ wrapping function.
-const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes, double **bb_min, double **bb_max, double **vertices, int *max_nv,
+const char *hyperion_voropp_wrap(int **neighbours, int start, int end, int *max_nn, double **volumes, double **bb_min, double **bb_max, double **vertices, int *max_nv,
                   double xmin, double xmax, double ymin, double ymax, double zmin, double zmax,
                   double const *points, int npoints, int with_vertices, const char *wall_str, const double *wall_args_arr, int n_wall_args, int verbose);
 
@@ -53,11 +53,11 @@ MOD_INIT(_voronoi_core)
 static PyObject *_voropp_wrapper(PyObject *self, PyObject *args)
 {
     PyObject *sites_obj, *domain_obj, *wall_args_obj;
-    int with_vertices;
+    int start, end, with_vertices;
     const char *wall_str;
     int verbose;
 
-    if (!PyArg_ParseTuple(args, "OOisOi", &sites_obj, &domain_obj, &with_vertices,&wall_str,&wall_args_obj, &verbose))
+    if (!PyArg_ParseTuple(args, "OiiOisOi", &sites_obj, &start, &end, &domain_obj, &with_vertices, &wall_str, &wall_args_obj, &verbose))
         return NULL;
 
     // Handle the wall-related arguments.
@@ -94,13 +94,14 @@ static PyObject *_voropp_wrapper(PyObject *self, PyObject *args)
     double *d_data = (double*)PyArray_DATA(d_array);
 
     int nsites = (int)PyArray_DIM(s_array, 0);
+    int ncells = end - start;
 
     double *volumes = NULL, *bb_min = NULL, *bb_max = NULL, *vertices = NULL;
     int *neighbours = NULL;
     int max_nn, max_nv;
 
     // Call the wrapper.
-    const char *status = hyperion_voropp_wrap(&neighbours,&max_nn,&volumes,&bb_min,&bb_max,&vertices,&max_nv,
+    const char *status = hyperion_voropp_wrap(&neighbours,start,end,&max_nn,&volumes,&bb_min,&bb_max,&vertices,&max_nv,
                                               d_data[0],d_data[1],d_data[2],d_data[3],d_data[4],d_data[5],s_data,nsites,with_vertices,
                                               wall_str,wall_args_arr,n_wall_args,verbose
                                              );
@@ -116,10 +117,10 @@ static PyObject *_voropp_wrapper(PyObject *self, PyObject *args)
     // without copy. See, e.g., here:
     // http://blog.enthought.com/python/numpy-arrays-with-pre-allocated-memory
     // We will just create new numpy arrays and return them for now.
-    npy_intp vol_dims[] = {nsites};
-    npy_intp neigh_dims[] = {nsites,max_nn};
-    npy_intp bb_dims[] = {nsites,3};
-    npy_intp vert_dims[] = {nsites,max_nv};
+    npy_intp vol_dims[] = {ncells};
+    npy_intp neigh_dims[] = {ncells,max_nn};
+    npy_intp bb_dims[] = {ncells,3};
+    npy_intp vert_dims[] = {ncells,max_nv};
 
     PyObject *vol_array = PyArray_SimpleNew(1,vol_dims,NPY_DOUBLE);
     PyObject *neigh_array = PyArray_SimpleNew(2,neigh_dims,NPY_INT);
@@ -146,12 +147,12 @@ static PyObject *_voropp_wrapper(PyObject *self, PyObject *args)
     }
 
     // Copy over the data.
-    memcpy((double*)PyArray_DATA(vol_array),volumes,sizeof(double) * nsites);
-    memcpy((int*)PyArray_DATA(neigh_array),neighbours,sizeof(int) * nsites * max_nn);
-    memcpy((double*)PyArray_DATA(bb_min_array),bb_min,sizeof(double) * nsites * 3);
-    memcpy((double*)PyArray_DATA(bb_max_array),bb_max,sizeof(double) * nsites * 3);
+    memcpy((double*)PyArray_DATA(vol_array),volumes,sizeof(double) * ncells);
+    memcpy((int*)PyArray_DATA(neigh_array),neighbours,sizeof(int) * ncells * max_nn);
+    memcpy((double*)PyArray_DATA(bb_min_array),bb_min,sizeof(double) * ncells * 3);
+    memcpy((double*)PyArray_DATA(bb_max_array),bb_max,sizeof(double) * ncells * 3);
     if (with_vertices) {
-        memcpy((double*)PyArray_DATA(vert_array),vertices,sizeof(double) * nsites * max_nv);
+        memcpy((double*)PyArray_DATA(vert_array),vertices,sizeof(double) * ncells * max_nv);
     }
 
     PyObject *retval;

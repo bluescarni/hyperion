@@ -13,7 +13,7 @@
 
 #include "voro++/voro++.hh"
 
-extern "C" const char * hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes, double **bb_min, double **bb_max, double **vertices,
+extern "C" const char * hyperion_voropp_wrap(int **neighbours, int start, int end, int *max_nn, double **volumes, double **bb_min, double **bb_max, double **vertices,
                                              int *max_nv, double xmin, double xmax, double ymin, double ymax, double zmin, double zmax,
                                              double const *points, int npoints, int with_vertices, const char *wall_str, const double *wall_args_arr, int n_wall_args, int verbose);
 
@@ -112,7 +112,7 @@ static inline void add_walls(container &con,const char *wall_str,const double *w
 }
 
 // Main wrapper called from cpython.
-const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes, double **bb_min, double **bb_max, double **vertices,
+const char *hyperion_voropp_wrap(int **neighbours, int start, int end, int *max_nn, double **volumes, double **bb_min, double **bb_max, double **vertices,
                                  int *max_nv, double xmin, double xmax, double ymin, double ymax, double zmin, double zmax, double const *points,
                                  int nsites, int with_vertices, const char *wall_str, const double *wall_args_arr, int n_wall_args, int verbose)
 {
@@ -135,8 +135,13 @@ const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes
     const int ny = (int)((ymax - ymin) / vol_edge * block_edge) + 1;
     const int nz = (int)((zmax - zmin) / vol_edge * block_edge) + 1;
 
+    // Number of cells to be computed
+    const int ncells = end - start;
+
     if (verbose) {
-        std::cout << "Number of sites: " << nsites << '\n';
+        std::cout << "Total number of sites: " << nsites << '\n';
+        std::cout << "Number of cells to be computed: " << ncells << '\n';
+        std::cout << "Range: [" << start << ',' << end << "]\n";
         std::cout << "Domain: [" << xmin << ',' << xmax << "] [" << ymin << ',' << ymax << "] [" << zmin << ',' << zmax << "]\n";
         std::cout << "Initialising with the following block grid: " << nx << ',' << ny << ',' << nz << '\n';
         std::cout << std::boolalpha;
@@ -145,23 +150,29 @@ const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes
 
     // Prepare the output quantities.
     // Neighbour list.
-    std::vector<std::vector<int> > n_list(nsites);
+    std::vector<std::vector<int> > n_list(ncells);
     // List of vertices.
     std::vector<std::vector<double> > vertices_list;
     if (with_vertices) {
-        vertices_list.resize(nsites);
+        vertices_list.resize(ncells);
     }
     // Volumes.
-    ptr_raii<double> vols(static_cast<double *>(std::malloc(sizeof(double) * nsites)));
+    ptr_raii<double> vols(static_cast<double *>(std::malloc(sizeof(double) * ncells)));
     // Bounding boxes.
-    ptr_raii<double> bb_m(static_cast<double *>(std::malloc(sizeof(double) * nsites * 3)));
-    ptr_raii<double> bb_M(static_cast<double *>(std::malloc(sizeof(double) * nsites * 3)));
-    
-    // Initialise the voro++ container.
+    ptr_raii<double> bb_m(static_cast<double *>(std::malloc(sizeof(double) * ncells * 3)));
+    ptr_raii<double> bb_M(static_cast<double *>(std::malloc(sizeof(double) * ncells * 3)));
+
+    // Initialise the voro++ container. All particles must be placed inside the container,
+    // and we record in the po variable those particles whose cells we need to compute.
+    particle_order po;
     container con(xmin,xmax,ymin,ymax,zmin,zmax,nx,ny,nz,
                   false,false,false,8);
     for(int i = 0; i < nsites; ++i) {
-            con.put(i,points[i*3],points[i*3 + 1],points[i*3 + 2]);
+            if (i >= start && i < end) {
+                con.put(po,i,points[i*3],points[i*3 + 1],points[i*3 + 2]);
+            } else {
+                con.put(i,points[i*3],points[i*3 + 1],points[i*3 + 2]);
+            }
     }
 
     // Handle the walls.
@@ -169,19 +180,20 @@ const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes
 
     // Initialise the looping variables and the temporary cell object used for computation.
     voronoicell_neighbor c;
-    c_loop_all vl(con);
+    c_loop_order vl(con,po);
     int idx;
     double tmp_min[3],tmp_max[3];
     std::vector<double> tmp_v;
     // Site position and radius (r is unused).
     double x,y,z,r;
 
-    // Loop over all particles and compute the desired quantities.
+    // Loop over the selected particles and compute the desired quantities.
     if(vl.start()) {
         do {
             // Get the id and position of the site being considered.
             vl.pos(idx,x,y,z,r);
-            std::vector<double> *tmp_vertices = with_vertices ? &(vertices_list[idx]) : &tmp_v; 
+            idx -= start;
+            std::vector<double> *tmp_vertices = with_vertices ? &(vertices_list[idx]) : &tmp_v;
             // Compute the voronoi cell.
             con.compute_cell(c,vl);
             // Compute the neighbours.
@@ -206,19 +218,7 @@ const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes
             // Copy the bounding box into the output array.
             std::copy(tmp_min,tmp_min + 3,bb_m.get() + idx * 3);
             std::copy(tmp_max,tmp_max + 3,bb_M.get() + idx * 3);
-        } while(vl.inc());   
-    }
-
-    // The voro++ doc say that in case of numerical errors the neighbours list might not be symmetric,
-    // that is, if 'a' is a neighbour of 'b' then 'b' might not be a neighbour of 'a'. We check and fix this
-    // in the loop below.
-    for (idx = 0; idx < nsites; ++idx) {
-        for (unsigned j = 0u; j < n_list[idx].size(); ++j) {
-            // Check only non-wall neighbours.
-            if (n_list[idx][j] >= 0 && std::find(n_list[n_list[idx][j]].begin(),n_list[n_list[idx][j]].end(),idx) == n_list[n_list[idx][j]].end()) {
-                n_list[n_list[idx][j]].push_back(idx);
-            }
-        }
+        } while(vl.inc());
     }
 
     // Compute the max number of neighbours.
@@ -226,9 +226,9 @@ const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes
     if (verbose) std::cout << "Max number of neighbours is: " << *max_nn << '\n';
 
     // Allocate space for flat array of neighbours.
-    ptr_raii<int> neighs(static_cast<int *>(std::malloc(sizeof(int) * nsites * (*max_nn))));
+    ptr_raii<int> neighs(static_cast<int *>(std::malloc(sizeof(int) * ncells * (*max_nn))));
     // Fill it in.
-    for (idx = 0; idx < nsites; ++idx) {
+    for (idx = 0; idx < ncells; ++idx) {
         int *ptr = neighs.get() + (*max_nn) * idx;
         std::copy(n_list[idx].begin(),n_list[idx].end(),ptr);
         // Fill empty elements with -10.
@@ -241,9 +241,9 @@ const char *hyperion_voropp_wrap(int **neighbours, int *max_nn, double **volumes
         if (verbose) std::cout << "Max number of vertices coordinates is: " << *max_nv << '\n';
 
         // Allocate space for flat array of vertices.
-        ptr_raii<double> verts(static_cast<double *>(std::malloc(sizeof(double) * nsites * (*max_nv))));
+        ptr_raii<double> verts(static_cast<double *>(std::malloc(sizeof(double) * ncells * (*max_nv))));
         // Fill it in.
-        for (idx = 0; idx < nsites; ++idx) {
+        for (idx = 0; idx < ncells; ++idx) {
             double *ptr = verts.get() + (*max_nv) * idx;
             std::copy(vertices_list[idx].begin(),vertices_list[idx].end(),ptr);
             // Fill empty elements with nan.

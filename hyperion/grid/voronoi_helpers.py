@@ -1,5 +1,8 @@
 from astropy import log as logger
 
+def _wrap(t):
+    from ._voronoi_core import _voropp_wrapper
+    return _voropp_wrapper(*t)
 
 class voronoi_grid(object):
     '''
@@ -47,8 +50,8 @@ class voronoi_grid(object):
 
     def __init__(self, sites, domain, with_vertices=False, wall=None, wall_args=None, verbose=False):
         import numpy as np
-        from ._voronoi_core import _voropp_wrapper
         from astropy.table import Table
+        import multiprocessing as mp
 
         # Validate input.
         if not isinstance(sites, np.ndarray) or sites.dtype.kind != 'f':
@@ -95,12 +98,57 @@ class voronoi_grid(object):
         self._with_vertices = with_vertices
 
         logger.info("Computing the tessellation via voro++")
-        tup = _voropp_wrapper(sites, domain, with_vertices, wall, wall_args, 1 if verbose else 0)
+
+        # Init the pool.
+        ncpus = mp.cpu_count()
+        pool = mp.Pool(ncpus)
+
+        # Calculate the chunks.
+        chunk_size = len(sites) // ncpus
+        chunks = []
+        for i in range(0,ncpus - 1):
+            chunks.append((i * chunk_size,(i + 1) * chunk_size))
+        # Last chunk.
+        chunks.append(((ncpus - 1) * chunk_size,len(sites)))
+
+        import time
+        time_start = time.time()
+        res = pool.map(_wrap,[(sites,chunk[0],chunk[1],domain,with_vertices,wall,wall_args, 1 if verbose else 0) for chunk in chunks])
+        print(time.time() - time_start)
+
+        pool.close()
+        pool.join()
+
+        # We need to re-compute the max number of neighbours, as each chunk will have a different value.
+        max_nn = max(res,key = lambda r: r[0].shape[1])[0].shape[1]
+        n_list = []
+        for r in res:
+            # Create a temp array with the desired shape, and fill it with -10 (the value to indicate no neigh).
+            tmp = np.zeros((r[0].shape[0],max_nn),dtype=np.int)
+            tmp.fill(-10)
+            # Get the neighbours from r and write them into tmp.
+            tmp[:,:r[0].shape[1]] = r[0]
+            n_list.append(tmp)
+        # Build the final list of neighbours.
+        n_list = np.vstack(n_list)
+
+        # Do the same with vertices, if requested.
         if with_vertices:
-            t = Table([sites, tup[0], tup[1], tup[2], tup[3], tup[4]],
+            max_nv = max(res,key = lambda r: r[4].shape[1])[4].shape[1]
+            v_list = []
+            for r in res:
+                tmp = np.zeros((r[4].shape[0],max_nv),dtype=np.float)
+                tmp.fill(float("nan"))
+                tmp[:,:r[4].shape[1]] = r[4]
+                v_list.append(tmp)
+            v_list = np.vstack(v_list)
+
+        # Build the table.
+        if with_vertices:
+            t = Table([sites, n_list, np.hstack([r[1] for r in res]), np.vstack([r[2] for r in res]), np.vstack([r[3] for r in res]), v_list],
                       names=('coordinates', 'neighbours', 'volume', 'bb_min', 'bb_max', 'vertices'))
         else:
-            t = Table([sites, tup[0], tup[1], tup[2], tup[3]],
+            t = Table([sites, n_list, np.hstack([r[1] for r in res]), np.vstack([r[2] for r in res]), np.vstack([r[3] for r in res])],
                       names=('coordinates', 'neighbours', 'volume', 'bb_min', 'bb_max'))
         self._neighbours_table = t
 
