@@ -111,9 +111,16 @@ class voronoi_grid(object):
         # Last chunk.
         chunks.append(((ncpus - 1) * chunk_size,len(sites)))
 
+        # Shuffle the input points, recording their order before the shuffle.
+        s_index_array = np.arange(sites.shape[0])
+        # Make it deterministic.
+        np.random.seed(0)
+        np.random.shuffle(s_index_array)
+        s_sites = sites[s_index_array]
+
         import time
         time_start = time.time()
-        res = pool.map(_wrap,[(sites,chunk[0],chunk[1],domain,with_vertices,wall,wall_args, 1 if verbose else 0) for chunk in chunks])
+        res = pool.map(_wrap,[(s_sites,chunk[0],chunk[1],domain,with_vertices,wall,wall_args, 1 if verbose else 0) for chunk in chunks])
         print(time.time() - time_start)
 
         pool.close()
@@ -145,10 +152,10 @@ class voronoi_grid(object):
 
         # Build the table.
         if with_vertices:
-            t = Table([sites, n_list, np.hstack([r[1] for r in res]), np.vstack([r[2] for r in res]), np.vstack([r[3] for r in res]), v_list],
+            t = Table([s_sites, n_list, np.hstack([r[1] for r in res]), np.vstack([r[2] for r in res]), np.vstack([r[3] for r in res]), v_list],
                       names=('coordinates', 'neighbours', 'volume', 'bb_min', 'bb_max', 'vertices'))
         else:
-            t = Table([sites, n_list, np.hstack([r[1] for r in res]), np.vstack([r[2] for r in res]), np.vstack([r[3] for r in res])],
+            t = Table([s_sites, n_list, np.hstack([r[1] for r in res]), np.vstack([r[2] for r in res]), np.vstack([r[3] for r in res])],
                       names=('coordinates', 'neighbours', 'volume', 'bb_min', 'bb_max'))
         self._neighbours_table = t
 
